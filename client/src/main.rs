@@ -1,0 +1,101 @@
+use dotenvy::dotenv;
+use futures::{SinkExt, StreamExt};
+use shared::{Msg, HEARTBEAT_INTERVAL};
+use std::{io, time::Duration};
+use tokio::{
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
+    },
+    sync::mpsc::{Receiver, Sender},
+    time,
+};
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use tracing::{debug, error, info, Level};
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let _ = dotenv();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_file(true)
+        .with_ansi(true)
+        .pretty()
+        .with_line_number(true)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    let port = std::env::var("PORT").unwrap_or("8080".to_string());
+    let _span = tracing::span!(tracing::Level::INFO, "client");
+    let _guard = _span.enter();
+    let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await?;
+    let (read_half, write_half) = stream.into_split();
+    let framed_write = FramedWrite::new(
+        write_half,
+        LengthDelimitedCodec::builder()
+            .length_field_length(2)
+            .big_endian()
+            .new_codec(),
+    );
+    let framed_read = FramedRead::new(
+        read_half,
+        LengthDelimitedCodec::builder()
+            .length_field_length(2)
+            .big_endian()
+            .new_codec(),
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel(100);
+    tokio::spawn(incoming_frames(framed_read, tx.clone()));
+    tokio::spawn(outgoing_frames(framed_write, rx));
+
+    tx.send(Msg::ClientHello).await.unwrap();
+    tokio::signal::ctrl_c().await
+}
+
+// send heartbeat msg at specified interval in shared/src/lib.rs
+async fn handle_heartbeat(tx: Sender<Msg>) {
+    let mut interval = time::interval(Duration::from_secs(HEARTBEAT_INTERVAL));
+    loop {
+        interval.tick().await;
+        let msg = Msg::Heartbeat;
+        tx.send(msg).await.unwrap();
+    }
+}
+
+type ClientStream = FramedRead<OwnedReadHalf, LengthDelimitedCodec>;
+type ClientSink = FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>;
+
+async fn incoming_frames(mut framed_read: ClientStream, tx: Sender<Msg>) {
+    while let Some(msg) = framed_read.next().await {
+        match msg {
+            Ok(msg) => {
+                let decoded = Msg::deserialize(&msg).expect("Failed to deserialize message");
+                match decoded {
+                    Msg::ClientHelloAck(id) => {
+                        info!("Received client hello ack: new client id is {}", id);
+                        let hb_tx = tx.clone();
+                        tokio::spawn(handle_heartbeat(hb_tx));
+                    }
+                    _ => {
+                        error!("Received unexpected message: {:?}", msg);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to read from socket: {:?}", e);
+                break;
+            }
+        }
+    }
+}
+
+async fn outgoing_frames(mut framed_write: ClientSink, mut rx: Receiver<Msg>) {
+    let _span = tracing::span!(tracing::Level::INFO, "outgoing_frames");
+    let _guard = _span.enter();
+    while let Some(msg) = rx.recv().await {
+        debug!("Message to send:\n{:#?}", msg);
+        if let Ok(encoded) = msg.serialize() {
+            info!("Sending message: {:?}", encoded);
+            let _ = framed_write.send(encoded).await;
+        }
+    }
+}

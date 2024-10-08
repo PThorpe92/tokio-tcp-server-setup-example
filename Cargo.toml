@@ -1,0 +1,26 @@
+[package]
+name = "tokio-tcp"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["shared", ".", "client"]
+
+[[bin]]
+path = "src/main.rs"
+name = "tokio-tcp-example"
+
+[[bin]]
+path = "client/src/main.rs"
+name = "tokio-tcp-client"
+
+
+[dependencies]
+tokio = { version = "1.40.0", features = ["full"] }
+tokio-util = { version = "0.7.12", features = ["full"] }
+shared = { path = "./shared"}
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["ansi"] }
+dotenvy = "0.15.7"
+futures = "0.3.31"
+bytes = "1.7.2"
