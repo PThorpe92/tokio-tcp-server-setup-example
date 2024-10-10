@@ -12,19 +12,13 @@ use tokio::{
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, error, info, Level};
+use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let _ = dotenv();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .with_file(true)
-        .with_ansi(true)
-        .pretty()
-        .with_line_number(true)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
     let port = std::env::var("PORT").unwrap_or("8080".to_string());
+    init_logging();
     let _span = tracing::span!(tracing::Level::INFO, "client");
     let _guard = _span.enter();
     let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await?;
@@ -47,8 +41,32 @@ async fn main() -> io::Result<()> {
     tokio::spawn(incoming_frames(framed_read, tx.clone()));
     tokio::spawn(outgoing_frames(framed_write, rx));
 
-    tx.send(Msg::ClientHello).await.unwrap();
+    if tx.send(Msg::ClientHello).await.is_ok() {
+        info!("Sent client hello");
+    }
     tokio::signal::ctrl_c().await
+}
+
+fn init_logging() {
+    let env = std::env::var("APP_ENV").unwrap_or("dev".to_string());
+    let log_level = std::env::var("LOG_LEVEL").unwrap_or(match env.as_str() {
+        "prod" | "production" => "INFO".to_string(),
+        _ => "DEBUG".to_string(),
+    });
+    let level = match log_level.to_uppercase().as_str() {
+        "DEBUG" => Level::DEBUG,
+        "INFO" => Level::INFO,
+        "WARN" => Level::WARN,
+        "ERROR" => Level::ERROR,
+        _ => Level::INFO,
+    };
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(level)
+        .with_line_number(true)
+        .pretty()
+        .with_ansi(env != "prod")
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 }
 
 // send heartbeat msg at specified interval in shared/src/lib.rs

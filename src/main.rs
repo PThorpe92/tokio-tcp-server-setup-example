@@ -7,14 +7,28 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-pub static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(100);
+pub static NEXT_CLIENT_ID: AtomicUsize = AtomicUsize::new(69420);
 
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
-    let env = std::env::var("APP_ENV").unwrap_or("dev".to_string());
     let port = std::env::var("PORT").unwrap_or("8080".to_string());
-    let log_level = std::env::var("LOG_LEVEL").unwrap_or("INFO".to_string());
+    init_logging();
+    let span = tracing::span!(Level::INFO, "main_span");
+    let _enter = span.enter();
+    info!("Starting server on port {}", port);
+    tokio::spawn(handle_connection(port));
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install CTRL+C signal handler");
+}
+
+fn init_logging() {
+    let env = std::env::var("APP_ENV").unwrap_or("dev".to_string());
+    let log_level = std::env::var("LOG_LEVEL").unwrap_or(match env.as_str() {
+        "prod" | "production" => "INFO".to_string(),
+        _ => "DEBUG".to_string(),
+    });
     let level = match log_level.to_uppercase().as_str() {
         "DEBUG" => Level::DEBUG,
         "INFO" => Level::INFO,
@@ -28,16 +42,7 @@ async fn main() {
         .pretty()
         .with_ansi(env != "prod")
         .finish();
-    info!("Starting server on port {}", port);
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-    let span = tracing::span!(Level::INFO, "main_span");
-    let _enter = span.enter();
-    tokio::spawn(async move {
-        handle_connection(port).await;
-    });
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C signal handler");
 }
 
 async fn handle_connection(port: String) {
@@ -47,18 +52,20 @@ async fn handle_connection(port: String) {
         .expect("failed to bind to port");
     loop {
         if let Ok((stream, _)) = listener.accept().await {
+            // **structure this all how you please**
+            //
             // one set of mpsc channels per client, one sender you can keep either in a static map of
             // clients or pass around to tasks that need to send to the client, and the receiver is
             // owned by the task that writes to the sink. you can think about this like you
             // internal messaging to and from the client, while a task you spawn on connection
             // each owns the actual sink/steam
-            let (client_tx, client_rx) = tokio::sync::mpsc::channel::<Msg>(256);
+            let (client_tx, client_rx) = tokio::sync::mpsc::channel::<Msg>(100);
             //
             // another set of mpsc channels for internal server state you can choose similarly.
             // likely the receiver would be owned by it's own task and that will get internal
             // msgs and process them into messages to send to the client tx.
             // but ultimately how you structure this is up to you
-            let (server_state_tx, server_state_rx) = tokio::sync::mpsc::channel::<Msg>(256);
+            let (server_state_tx, _server_state_rx) = tokio::sync::mpsc::channel::<Msg>(100);
 
             let (read_half, write_half) = stream.into_split();
             let mut read_framed = FramedRead::new(
@@ -77,6 +84,7 @@ async fn handle_connection(port: String) {
             );
             if let Some(Ok(msg)) = read_framed.next().await {
                 if let Ok(Msg::ClientHello) = Msg::deserialize(&msg) {
+                    // just an example
                     info!("Received ClientHello");
                     let client_id = add_client(&client_tx);
                     let _ = write_framed
@@ -86,13 +94,9 @@ async fn handle_connection(port: String) {
                                 .unwrap_or_default(),
                         )
                         .await;
-                    tokio::spawn(async move {
-                        client_inbound(client_id, read_framed, server_state_tx).await;
-                    });
-                    tokio::spawn(async move {
-                        // the clients receiving channel is owned by the task handling the writer
-                        client_outbound(client_id, write_framed, client_rx).await;
-                    });
+                    tokio::spawn(client_inbound(client_id, read_framed, server_state_tx));
+                    // the clients receiving channel is owned by the task handling the writer
+                    tokio::spawn(client_outbound(client_id, write_framed, client_rx));
                     // here you can spawn your tasks to kick off the remainder of your internal
                     // processing and logic, at least one will own the servers rx channel
                 }
